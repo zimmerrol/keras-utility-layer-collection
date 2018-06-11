@@ -19,7 +19,7 @@
 # THE SOFTWARE.
 
 import keras.backend as K
-from keras.layers import Layer, Dense, TimeDistributed, Concatenate
+from keras.layers import Layer, Dense, TimeDistributed, Concatenate, InputSpec, Wrapper, RNN
 
 
 class ScaledDotProductAttention(Layer):
@@ -259,3 +259,106 @@ class SequenceAttention(Layer):
         similarity = K.squeeze(similarity, 2)
         
         return similarity
+
+class AttentionRNNWrapper(Wrapper):
+    def __init__(self, layer, weight_initializer="glorot_uniform", **kwargs):
+        assert isinstance(layer, RNN)
+        self.layer = layer
+        self.supports_masking = True
+        self.weight_initializer = weight_initializer
+        
+        super(AttentionRNNWrapper, self).__init__(layer, **kwargs)
+        
+    def _validate_input_shape(self, input_shape):
+        if len(input_shape) != 1:
+            raise ValueError("Layer received an input with shape {0} but expected only one input.".format(input_shape))
+        else:
+            if len(input_shape[0]) != 3:
+                raise ValueError("Layer received an input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
+
+    def build(self, input_shape):
+        self._validate_input_shape(input_shape)
+
+        self.input_spec = InputSpec(shape=input_shape)
+        
+        if not self.layer.built:
+            self.layer.build(input_shape)
+            self.layer.built = True
+            
+        input_dim = input_shape[2]
+        output_dim = self.layer.compute_output_shape(input_shape)[-1]
+            
+        self._W1 = self.add_weight(shape=(input_dim, input_dim), name="{}_W1".format(self.name), initializer=self.weight_initializer)
+        self._W2 = self.add_weight(shape=(output_dim, input_dim), name="{}_W2".format(self.name), initializer=self.weight_initializer)
+        self._W3 = self.add_weight(shape=(2*input_dim, input_dim), name="{}_W3".format(self.name), initializer=self.weight_initializer)
+        self._b2 = self.add_weight(shape=(input_dim,), name="{}_b2".format(self.name), initializer=self.weight_initializer)
+        self._b3 = self.add_weight(shape=(input_dim,), name="{}_b3".format(self.name), initializer=self.weight_initializer)
+        self._V = self.add_weight(shape=(input_dim,1), name="{}_V".format(self.name), initializer=self.weight_initializer)
+        
+        super(AttentionRNNWrapper, self).build()
+        
+    def compute_output_shape(self, input_shape):
+        self._validate_input_shape(input_shape)
+
+        return self.layer.compute_output_shape(input_shape)
+    
+    def step(self, x, states):        
+        h = states[0]
+        # states[1] necessary?
+        
+        # comes from the constants
+        # equals K.dot(X, self._W1) + self._b2 with X.shape=[bs, T, input_dim]
+        X = states[2]
+        total_x_prod = states[3]
+        
+        # expand dims to add the vector which is only valid for this time step
+        # to total_x_prod which is valid for all time steps
+        hw = K.expand_dims(K.dot(h, self._W2), 1)
+        additive_atn = total_x_prod + hw
+        attention = K.softmax(K.dot(additive_atn, self._V), axis=1)
+        x = K.sum(attention * X, [1])
+        
+        h, new_states = self.layer.cell.call(x, states[:-2])
+        
+        return h, new_states
+    
+    def call(self, x, constants=None, mask=None):
+        # input shape: (n_samples, time (padded with zeros), input_dim)
+        input_shape = self.input_spec.shape
+        
+        if self.layer.stateful:
+            initial_states = self.layer.states
+        else:
+            initial_states = self.layer.get_initial_state(x)
+            
+        if not constants:
+            constants = []
+            
+        constants += self.get_constants(x)
+        
+        last_output, outputs, states = K.rnn(
+            self.step,
+            x,
+            initial_states,
+            go_backwards=self.layer.go_backwards,
+            mask=mask,
+            constants=constants,
+            unroll=self.layer.unroll,
+            input_length=input_shape[1]
+        )
+        
+        if self.layer.stateful:
+            self.updates = []
+            for i in range(len(states)):
+                self.updates.append((self.layer.states[i], states[i]))
+
+        if self.layer.return_sequences:
+            return outputs
+        else:
+            return last_output 
+
+    def get_constants(self, x):
+        # add constants to speed up calculation
+        constants = [x, K.dot(x, self._W1) + self._b2]
+        
+        return constants
