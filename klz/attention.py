@@ -185,10 +185,18 @@ class MultiHeadAttention(Layer):
 # https://wanasit.github.io/attention-based-sequence-to-sequence-in-keras.html
 # https://arxiv.org/pdf/1508.04025.pdf
 class SequenceAttention(Layer):
-    def __init__(self, similarity, units, kernel_initializer="glorot_uniform", **kwargs):
+    """
+        Takes two inputs of the shape (batch_size, T, dim1) and (batch_size, T, dim2),
+        whereby the first item is the source data and the second one the key data.
+        This layer then calculates for each batch's element and each time step a softmax attention 
+        vector between the key data and the source data. Finally, this attention vector is multiplied
+        with the source data to obtain a weighted output. This means, that the key data is used to
+        interpret the source data in a special way to create an output of the same shape as the source data.
+    """
+    def __init__(self, similarity, kernel_initializer="glorot_uniform", **kwargs):
         super(SequenceAttention, self).__init__(**kwargs)
         if isinstance(similarity, str):
-            ALLOWED_SIMILARITIES = ["additive", ]
+            ALLOWED_SIMILARITIES = ["additive", "multiplicative" ]
             if similarity not in ALLOWED_SIMILARITIES:
                 raise ValueError("`similarity` has to be either a callable or one of the following: {0}".format(ALLOWED_SIMILARITIES))
             else:
@@ -198,7 +206,6 @@ class SequenceAttention(Layer):
         else:
             raise ValueError("`similarity` has to be either a callable or one of the following: {0}".format(ALLOWED_SIMILARITIES))
             
-        self._units = units
         self._kernel_initializer = kernel_initializer
             
     def build(self, input_shape):
@@ -209,23 +216,32 @@ class SequenceAttention(Layer):
         if self._similarity == self._additive_similarity:
             self._weights["w_a"] = self.add_weight(
                 name='w_a', 
-                shape=(input_shape[0][-1] + input_shape[1][-1], self._units),
+                shape=(input_shape[0][-1] + input_shape[1][-1], input_shape[0][-1]),
                 initializer=self._kernel_initializer,
                 trainable=True
             )
             
             self._weights["v_a"] = self.add_weight(
                 name='v_a', 
-                shape=(self._units, 1),
+                shape=(1, input_shape[0][-1]),
                 initializer=self._kernel_initializer,
                 trainable=True
             )
+            
+        elif self._similarity == self._multiplicative_similarity:
+            self._weights["w_a"] = self.add_weight(
+                name='w_a', 
+                shape=(input_shape[1][-1], input_shape[0][-1]),
+                initializer=self._kernel_initializer,
+                trainable=True
+            )
+
         self.built = True
         
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
         
-        return (input_shape[0][0], input_shape[0][2])
+        return input_shape[0]
             
     def _validate_input_shape(self, input_shape):
         if len(input_shape) != 2:
@@ -234,29 +250,37 @@ class SequenceAttention(Layer):
             if input_shape[0][0] != input_shape[1][0]:
                 raise ValueError("Both two inputs (source, query) have to have the same batch size; received batch sizes: {0}, {1}".format(input_shape[0][0], input_shape[1][0]))
             if input_shape[0][1] != input_shape[1][1]:
-                raise ValueError("Both inputs (source, query) have to have the same length; received lengths: {0}, {1}, {2}".format(input_shape[0][0], input_shape[1][0]))
+                raise ValueError("Both inputs (source, query) have to have the same length; received lengths: {0}, {1}".format(input_shape[0][0], input_shape[1][0]))
         
     def call(self, x):
         source, query = x
         
         similarity = self._similarity(source, query)
-        expected_similarity_shape = [source.shape.as_list()[0], source.shape.as_list()[2]]
-        #if similarity.shape.as_list()[:2] != expected_similarity_shape:
-        #    raise RuntimeError("The similarity function has returned a similarity with shape {0}, but expected {1}".format(similarity.shape.as_list()[:2], expected_similarity_shape))
+        expected_similarity_shape = [source.shape.as_list()[0], source.shape.as_list()[1], source.shape.as_list()[1]]
+       
+        if similarity.shape.as_list() != expected_similarity_shape:
+            raise RuntimeError("The similarity function has returned a similarity with shape {0}, but expected {1}".format(similarity.shape.as_list()[:2], expected_similarity_shape))
         
         score = K.softmax(similarity)
-        
-        output = K.batch_dot(score, source)
+        output = K.batch_dot(score, source, axes=[1, 1])
         
         return output
     
     def _additive_similarity(self, source, query):
         concatenation = K.concatenate([source, query], axis=2)
+        nonlinearity = K.tanh(K.dot(concatenation, self._weights["w_a"]))
+        
+        # tile the weight vector (1, 1, dim) for each time step and each element of the batch -> (bs, T, dim)
+        source_shape = K.shape(source)
+        vaeff = K.tile(K.expand_dims(self._weights["v_a"], 0), [source_shape[0], source_shape[1], 1])
 
-        nonlinearity = K.tanh(K.dot(concatenation, self._weights["w_a"]) )
+        similarity = K.batch_dot(K.permute_dimensions(vaeff, [0, 2, 1]), nonlinearity, axes=[1, 2])
+        
+        return similarity
 
-        similarity = K.dot(nonlinearity, self._weights["v_a"])
-        similarity = K.squeeze(similarity, 2)
+    def _multiplicative_similarity(self, source, query):
+        qp = K.dot(query, self._weights["w_a"])
+        similarity = K.batch_dot(K.permute_dimensions(qp, [0, 2, 1]), source, axes=[1, 2])
         
         return similarity
 
