@@ -20,7 +20,7 @@
 
 import keras.backend as K
 from keras.layers import Layer, Dense, TimeDistributed, Concatenate, InputSpec, Wrapper, RNN
-
+import numpy as np
 
 class ScaledDotProductAttention(Layer):
     """
@@ -36,7 +36,7 @@ class ScaledDotProductAttention(Layer):
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
         
-        return input_shape
+        return input_shape[1]
     
     def _validate_input_shape(self, input_shape):
         if len(input_shape) != 3:
@@ -57,7 +57,7 @@ class ScaledDotProductAttention(Layer):
     def call(self, x):
         q, k, v = x
         d_k = q.shape.as_list()[2]
-        
+
         # in pure tensorflow:
         # weights = tf.matmul(x_batch, tf.transpose(y_batch, perm=[0, 2, 1]))
         # normalized_weights = tf.nn.softmax(weights/scaling)
@@ -105,7 +105,7 @@ class MultiHeadAttention(Layer):
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
         
-        return input_shape
+        return input_shape[1]
     
     def _validate_input_shape(self, input_shape):
         if len(input_shape) != 3:
@@ -147,8 +147,8 @@ class MultiHeadAttention(Layer):
             )
         
         self._output = TimeDistributed(Dense(d_model))
-        if self._return_attention:
-            self._output = Concatenate()
+        #if self._return_attention:
+        #    self._output = Concatenate()
         
         super(MultiHeadAttention, self).build(input_shape)
     
@@ -159,8 +159,8 @@ class MultiHeadAttention(Layer):
         attentions = []
         for i in range(self._h):
             qi = self._q_layers[i](q)
-            ki = self._k_layers[i](q)
-            vi = self._v_layers[i](q)
+            ki = self._k_layers[i](k)
+            vi = self._v_layers[i](v)
             
             if self._return_attention:
                 output, attention = self._sdp_layer([qi, ki, vi])
@@ -177,7 +177,7 @@ class MultiHeadAttention(Layer):
             attention = Concatenate()(attentions)
        
         if self._return_attention:
-            return output, attention
+            return [output, attention]
         else:
             return output        
 
@@ -285,6 +285,21 @@ class SequenceAttention(Layer):
         return similarity
 
 class AttentionRNNWrapper(Wrapper):
+    """
+        The idea of the implementation is based on the paper:
+            "Effective Approaches to Attention-based Neural Machine Translation" by Luong et al.
+
+        This layer is an attention layer, which can be wrapped around arbitrary RNN layers.
+        This way, after each time step an attention vector is calculated
+        based on the current output of the LSTM and the entire input time series.
+        This attention vector is then used as a weight vector to choose special values
+        from the input data. This data is then finally concatenated to the next input
+        time step's data. On this a linear transformation in the same space as the input data's space
+        is performed before the data is fed into the RNN cell again.
+
+        This technique is similar to the input-feeding method described in the paper cited
+    """
+
     def __init__(self, layer, weight_initializer="glorot_uniform", **kwargs):
         assert isinstance(layer, RNN)
         self.layer = layer
@@ -294,11 +309,8 @@ class AttentionRNNWrapper(Wrapper):
         super(AttentionRNNWrapper, self).__init__(layer, **kwargs)
         
     def _validate_input_shape(self, input_shape):
-        if len(input_shape) != 1:
-            raise ValueError("Layer received an input with shape {0} but expected only one input.".format(input_shape))
-        else:
-            if len(input_shape[0]) != 3:
-                raise ValueError("Layer received an input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
+        if len(input_shape) != 3:
+            raise ValueError("Layer received an input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
 
     def build(self, input_shape):
         self._validate_input_shape(input_shape)
@@ -309,9 +321,15 @@ class AttentionRNNWrapper(Wrapper):
             self.layer.build(input_shape)
             self.layer.built = True
             
-        input_dim = input_shape[2]
-        output_dim = self.layer.compute_output_shape(input_shape)[-1]
-            
+        input_dim = input_shape[-1]
+
+        if self.layer.return_sequences:
+            output_dim = self.layer.compute_output_shape(input_shape)[0][-1]
+        else:
+            output_dim = self.layer.compute_output_shape(input_shape)[-1]
+      
+        print(input_shape, input_dim, output_dim)
+
         self._W1 = self.add_weight(shape=(input_dim, input_dim), name="{}_W1".format(self.name), initializer=self.weight_initializer)
         self._W2 = self.add_weight(shape=(output_dim, input_dim), name="{}_W2".format(self.name), initializer=self.weight_initializer)
         self._W3 = self.add_weight(shape=(2*input_dim, input_dim), name="{}_W3".format(self.name), initializer=self.weight_initializer)
@@ -346,12 +364,14 @@ class AttentionRNNWrapper(Wrapper):
         
         return h, new_states
     
-    def call(self, x, constants=None, mask=None):
+    def call(self, x, constants=None, mask=None, initial_state=None):
         # input shape: (n_samples, time (padded with zeros), input_dim)
         input_shape = self.input_spec.shape
         
         if self.layer.stateful:
             initial_states = self.layer.states
+        elif initial_state is not None:
+            initial_states = initial_state
         else:
             initial_states = self.layer.get_initial_state(x)
             
@@ -377,9 +397,24 @@ class AttentionRNNWrapper(Wrapper):
                 self.updates.append((self.layer.states[i], states[i]))
 
         if self.layer.return_sequences:
-            return outputs
+            output = outputs
         else:
-            return last_output 
+            output = last_output 
+
+        # Properly set learning phase
+        if getattr(last_output, '_uses_learning_phase', False):
+            output._uses_learning_phase = True
+            for state in states:
+                state._uses_learning_phase = True
+
+        if self.layer.return_state:
+            if not isinstance(states, (list, tuple)):
+                states = [states]
+            else:
+                states = list(states)
+            return [output] + states
+        else:
+            return output
 
     def get_constants(self, x):
         # add constants to speed up calculation
