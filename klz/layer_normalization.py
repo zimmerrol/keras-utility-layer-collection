@@ -20,7 +20,7 @@
 
 import keras.backend as K
 from keras.layers import Layer
-from keras.initializer import Ones, Zeros
+from keras.initializers import Ones, Zeros
 
 
 class LayerNormalization(Layer):
