@@ -1,7 +1,8 @@
-# Keras Layer Zoo
+# Keras Layer Collection
 Collection of custom layers for Keras which are missing in the main framework. These layers might be useful to reproduce current state-of-the-art deep learning papers using Keras.
 
 ## Overview of implemented Layers
+At the moment the `Keras Layer Collection` offers the following layers/features:
 
 - [Scaled Dot-Product Attention](#sdpattention)
 - [Multi-Head Attention](#mhatn)
