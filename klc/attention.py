@@ -358,7 +358,9 @@ class AttentionRNNWrapper(Wrapper):
         hw = K.expand_dims(K.dot(h, self._W2), 1)
         additive_atn = total_x_prod + hw
         attention = K.softmax(K.dot(additive_atn, self._V), axis=1)
-        x = K.sum(attention * X, [1])
+        x_weighted = K.sum(attention * X, [1])
+        
+        x = K.dot(K.concatenate([x, x_weighted], 1), self._W3) + self._b3
         
         h, new_states = self.layer.cell.call(x, states[:-2])
         
@@ -379,6 +381,288 @@ class AttentionRNNWrapper(Wrapper):
             constants = []
             
         constants += self.get_constants(x)
+        
+        last_output, outputs, states = K.rnn(
+            self.step,
+            x,
+            initial_states,
+            go_backwards=self.layer.go_backwards,
+            mask=mask,
+            constants=constants,
+            unroll=self.layer.unroll,
+            input_length=input_shape[1]
+        )
+        
+        if self.layer.stateful:
+            self.updates = []
+            for i in range(len(states)):
+                self.updates.append((self.layer.states[i], states[i]))
+
+        if self.layer.return_sequences:
+            output = outputs
+        else:
+            output = last_output 
+
+        # Properly set learning phase
+        if getattr(last_output, '_uses_learning_phase', False):
+            output._uses_learning_phase = True
+            for state in states:
+                state._uses_learning_phase = True
+
+        if self.layer.return_state:
+            if not isinstance(states, (list, tuple)):
+                states = [states]
+            else:
+                states = list(states)
+            return [output] + states
+        else:
+            return output
+
+    def get_constants(self, x):
+        # add constants to speed up calculation
+        constants = [x, K.dot(x, self._W1) + self._b2]
+        
+        return constants
+
+class ExternalAttentionRNNWrapper(Wrapper):
+    """
+        The basic idea of the implementation is based on the paper:
+            "Effective Approaches to Attention-based Neural Machine Translation" by Luong et al.
+
+        This layer is an attention layer, which can be wrapped around arbitrary RNN layers.
+        This way, after each time step an attention vector is calculated
+        based on the current output of the LSTM and the entire input time series.
+        This attention vector is then used as a weight vector to choose special values
+        from the input data. This data is then finally concatenated to the next input
+        time step's data. On this a linear transformation in the same space as the input data's space
+        is performed before the data is fed into the RNN cell again.
+
+        This technique is similar to the input-feeding method described in the paper cited.
+
+        The only difference compared to the AttentionRNNWrapper is, that this layer
+        applies the attention layer not on the time-depending input but on a second
+        time-independent input (like image clues) as described in:
+            Show, Attend and Tell: Neural Image Caption Generation with Visual Attention
+            https://arxiv.org/abs/1502.03044
+    """
+    def __init__(self, layer, weight_initializer="glorot_uniform", **kwargs):
+        assert isinstance(layer, RNN)
+        self.layer = layer
+        self.supports_masking = True
+        self.weight_initializer = weight_initializer
+        
+        super(ExternalAttentionRNNWrapper, self).__init__(layer, **kwargs)
+        
+    def _validate_input_shape(self, input_shape):
+        if len(input_shape) != 2:
+            raise ValueError("Layer has to receive two inputs: the temporal signal and the external signal which is constant for all time steps")
+        if len(input_shape[0]) != 3:
+            raise ValueError("Layer received a temporal input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
+        if len(input_shape[1]) != 3:
+            raise ValueError("Layer received a time-independent input with shape {0} but expected a Tensor of rank 3.".format(input_shape[1]))
+
+    def build(self, input_shape):
+        self._validate_input_shape(input_shape)
+
+        self.input_spec = [InputSpec(shape=x) for x in input_shape]
+        
+        if not self.layer.built:
+            self.layer.build(input_shape)
+            self.layer.built = True
+            
+        temporal_input_dim = input_shape[0][-1]
+        static_input_dim = input_shape[1][-1]
+
+        if self.layer.return_sequences:
+            output_dim = self.layer.compute_output_shape(input_shape[0])[-1]
+        else:
+            output_dim = self.layer.compute_output_shape(input_shape[0])[-1]
+
+        if self.layer.return_state:
+            output_dim = output_dim[-1]
+      
+        self._W1 = self.add_weight(shape=(static_input_dim, temporal_input_dim), name="{}_W1".format(self.name), initializer=self.weight_initializer)
+        self._W2 = self.add_weight(shape=(output_dim, temporal_input_dim), name="{}_W2".format(self.name), initializer=self.weight_initializer)
+        self._W3 = self.add_weight(shape=(temporal_input_dim + static_input_dim, temporal_input_dim), name="{}_W3".format(self.name), initializer=self.weight_initializer)
+        self._b2 = self.add_weight(shape=(temporal_input_dim,), name="{}_b2".format(self.name), initializer=self.weight_initializer)
+        self._b3 = self.add_weight(shape=(temporal_input_dim,), name="{}_b3".format(self.name), initializer=self.weight_initializer)
+        self._V = self.add_weight(shape=(temporal_input_dim, 1), name="{}_V".format(self.name), initializer=self.weight_initializer)
+        
+        super(ExternalAttentionRNNWrapper, self).build()
+        
+    def compute_output_shape(self, input_shape):
+        self._validate_input_shape(input_shape)
+
+        return self.layer.compute_output_shape(input_shape[0])
+    
+    def step(self, x, states):        
+        h = states[0]
+        # states[1] necessary?
+        
+        # comes from the constants
+        X_static = states[2]
+        # equals K.dot(static_x, self._W1) + self._b2 with X.shape=[bs, L, static_input_dim]
+        total_x_static_prod = states[3]
+
+        # expand dims to add the vector which is only valid for this time step
+        # to total_x_prod which is valid for all time steps
+        hw = K.expand_dims(K.dot(h, self._W2), 1)
+        additive_atn = total_x_static_prod + hw
+        attention = K.softmax(K.tanh(K.dot(additive_atn, self._V)), axis=1)
+        static_x_weighted = K.sum(attention * X_static, [1])
+        
+        x = K.dot(K.concatenate([x, static_x_weighted], 1), self._W3) + self._b3
+
+        h, new_states = self.layer.cell.call(x, states[:-2])
+        
+        return h, new_states
+    
+    def call(self, x, constants=None, mask=None, initial_state=None):
+        # input shape: (n_samples, time (padded with zeros), input_dim)
+        input_shape = self.input_spec[0].shape
+        
+        static_x = x[1]
+        x = x[0]
+
+        if self.layer.stateful:
+            initial_states = self.layer.states
+        elif initial_state is not None:
+            initial_states = initial_state
+        else:
+            initial_states = self.layer.get_initial_state(x)
+            
+        if not constants:
+            constants = []
+        constants += self.get_constants(static_x)
+        
+        last_output, outputs, states = K.rnn(
+            self.step,
+            x,
+            initial_states,
+            go_backwards=self.layer.go_backwards,
+            mask=mask,
+            constants=constants,
+            unroll=self.layer.unroll,
+            input_length=input_shape[1]
+        )
+        
+        if self.layer.stateful:
+            self.updates = []
+            for i in range(len(states)):
+                self.updates.append((self.layer.states[i], states[i]))
+
+        if self.layer.return_sequences:
+            output = outputs
+        else:
+            output = last_output 
+
+        # Properly set learning phase
+        if getattr(last_output, '_uses_learning_phase', False):
+            output._uses_learning_phase = True
+            for state in states:
+                state._uses_learning_phase = True
+
+        if self.layer.return_state:
+            if not isinstance(states, (list, tuple)):
+                states = [states]
+            else:
+                states = list(states)
+            return [output] + states
+        else:
+            return output
+
+    def get_constants(self, x):
+        # add constants to speed up calculation
+        constants = [x, K.dot(x, self._W1) + self._b2]
+        
+        return constants
+
+    def __init__(self, layer, weight_initializer="glorot_uniform", **kwargs):
+        assert isinstance(layer, RNN)
+        self.layer = layer
+        self.supports_masking = True
+        self.weight_initializer = weight_initializer
+        
+        super(ExternalAttentionRNNWrapper, self).__init__(layer, **kwargs)
+        
+    def _validate_input_shape(self, input_shape):
+        if len(input_shape) != 2:
+            raise ValueError("Layer has to receive two inputs: the temporal signal and the external signal which is constant for all time steps")
+        if len(input_shape[0]) != 3:
+            raise ValueError("Layer received a temporal input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
+        if len(input_shape[1]) != 3:
+            raise ValueError("Layer received a time-independent input with shape {0} but expected a Tensor of rank 3.".format(input_shape[1]))
+
+    def build(self, input_shape):
+        self._validate_input_shape(input_shape)
+
+        self.input_spec = [InputSpec(shape=x) for x in input_shape]
+        
+        if not self.layer.built:
+            self.layer.build(input_shape)
+            self.layer.built = True
+            
+        temporal_input_dim = input_shape[0][-1]
+        static_input_dim = input_shape[1][-1]
+
+        if self.layer.return_sequences:
+            output_dim = self.layer.compute_output_shape(input_shape[0])[0][-1]
+        else:
+            output_dim = self.layer.compute_output_shape(input_shape[0])[-1]
+      
+        self._W1 = self.add_weight(shape=(static_input_dim, temporal_input_dim), name="{}_W1".format(self.name), initializer=self.weight_initializer)
+        self._W2 = self.add_weight(shape=(output_dim, temporal_input_dim), name="{}_W2".format(self.name), initializer=self.weight_initializer)
+        self._W3 = self.add_weight(shape=(temporal_input_dim + static_input_dim, temporal_input_dim), name="{}_W3".format(self.name), initializer=self.weight_initializer)
+        self._b2 = self.add_weight(shape=(temporal_input_dim,), name="{}_b2".format(self.name), initializer=self.weight_initializer)
+        self._b3 = self.add_weight(shape=(temporal_input_dim,), name="{}_b3".format(self.name), initializer=self.weight_initializer)
+        self._V = self.add_weight(shape=(temporal_input_dim, 1), name="{}_V".format(self.name), initializer=self.weight_initializer)
+        
+        super(ExternalAttentionRNNWrapper, self).build()
+        
+    def compute_output_shape(self, input_shape):
+        self._validate_input_shape(input_shape)
+
+        return self.layer.compute_output_shape(input_shape[0])
+    
+    def step(self, x, states):        
+        h = states[0]
+        # states[1] necessary?
+        
+        # comes from the constants
+        X_static = states[2]
+        # equals K.dot(static_x, self._W1) + self._b2 with X.shape=[bs, L, static_input_dim]
+        total_x_static_prod = states[3]
+
+        # expand dims to add the vector which is only valid for this time step
+        # to total_x_prod which is valid for all time steps
+        hw = K.expand_dims(K.dot(h, self._W2), 1)
+        additive_atn = total_x_static_prod + hw
+        attention = K.softmax(K.dot(additive_atn, self._V), axis=1)
+        static_x_weighted = K.sum(attention * X_static, [1])
+        
+        x = K.dot(K.concatenate([x, static_x_weighted], 1), self._W3) + self._b3
+
+        h, new_states = self.layer.cell.call(x, states[:-2])
+        
+        return h, new_states
+    
+    def call(self, x, constants=None, mask=None, initial_state=None):
+        # input shape: (n_samples, time (padded with zeros), input_dim)
+        input_shape = self.input_spec[0].shape
+        
+        static_x = x[1]
+        x = x[0]
+
+        if self.layer.stateful:
+            initial_states = self.layer.states
+        elif initial_state is not None:
+            initial_states = initial_state
+        else:
+            initial_states = self.layer.get_initial_state(x)
+            
+        if not constants:
+            constants = []
+        constants += self.get_constants(static_x)
         
         last_output, outputs, states = K.rnn(
             self.step,
