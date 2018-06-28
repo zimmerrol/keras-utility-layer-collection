@@ -6,8 +6,8 @@ from shutil import rmtree
 from setuptools import find_packages, setup, Command
 
 # Package meta-data.
-NAME = 'klc'
-DESCRIPTION = 'Keras Layer Collection.'
+NAME = 'kulc'
+DESCRIPTION = 'Keras Utility & Layer Collection.'
 URL = 'https://github.com/FlashTek/keras-layer-collection'
 EMAIL = 'rzrolandzimmermann@gmail.com'
 AUTHOR = 'Roland Zimmermann'

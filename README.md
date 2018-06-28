@@ -1,4 +1,4 @@
-# Keras Layer Collection
+# Keras Utility & Layer Collection
 Collection of custom layers for Keras which are missing in the main framework. These layers might be useful to reproduce current state-of-the-art deep learning papers using Keras.
 
 ## Overview of implemented Layers
