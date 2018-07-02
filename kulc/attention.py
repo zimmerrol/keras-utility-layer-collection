@@ -451,16 +451,23 @@ class ExternalAttentionRNNWrapper(Wrapper):
         self.supports_masking = True
         self.weight_initializer = weight_initializer
         self.return_attention = return_attention
-        
+        self._num_constants = None
+
         super(ExternalAttentionRNNWrapper, self).__init__(layer, **kwargs)
+
+        self.input_spec = [InputSpec(ndim=3), InputSpec(ndim=3)]
         
     def _validate_input_shape(self, input_shape):
-        if len(input_shape) != 2:
-            raise ValueError("Layer has to receive two inputs: the temporal signal and the external signal which is constant for all time steps")
-        if len(input_shape[0]) != 3:
-            raise ValueError("Layer received a temporal input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
-        if len(input_shape[1]) != 3:
-            raise ValueError("Layer received a time-independent input with shape {0} but expected a Tensor of rank 3.".format(input_shape[1]))
+
+        if len(input_shape) >= 2:
+            if len(input_shape[:2]) != 2:
+                raise ValueError("Layer has to receive two inputs: the temporal signal and the external signal which is constant for all time steps")
+            if len(input_shape[0]) != 3:
+                raise ValueError("Layer received a temporal input with shape {0} but expected a Tensor of rank 3.".format(input_shape[0]))
+            if len(input_shape[1]) != 3:
+                raise ValueError("Layer received a time-independent input with shape {0} but expected a Tensor of rank 3.".format(input_shape[1]))
+        else:
+            raise ValueError("Layer has to receive at least 2 inputs: the temporal signal and the external signal which is constant for all time steps")
 
     def build(self, input_shape):
         self._validate_input_shape(input_shape)
@@ -533,6 +540,11 @@ class ExternalAttentionRNNWrapper(Wrapper):
         # input shape: (n_samples, time (padded with zeros), input_dim)
         input_shape = self.input_spec[0].shape
         
+        if len(x) > 2:
+            initial_state = x[2:]
+            x = x[:2]
+            assert len(initial_state) == 2
+
         static_x = x[1]
         x = x[0]
 
@@ -597,6 +609,94 @@ class ExternalAttentionRNNWrapper(Wrapper):
             output = output + [attentions]
 
         return output
+
+    def _standardize_args(self, inputs, initial_state, constants, num_constants):
+        """Standardize `__call__` to a single list of tensor inputs.
+
+        When running a model loaded from file, the input tensors
+        `initial_state` and `constants` can be passed to `RNN.__call__` as part
+        of `inputs` instead of by the dedicated keyword arguments. This method
+        makes sure the arguments are separated and that `initial_state` and
+        `constants` are lists of tensors (or None).
+
+        # Arguments
+        inputs: tensor or list/tuple of tensors
+        initial_state: tensor or list of tensors or None
+        constants: tensor or list of tensors or None
+
+        # Returns
+        inputs: tensor
+        initial_state: list of tensors or None
+        constants: list of tensors or None
+        """
+        if isinstance(inputs, list) and len(inputs) > 2:
+            assert initial_state is None and constants is None
+            if num_constants is not None:
+                constants = inputs[-num_constants:]
+                inputs = inputs[:-num_constants]
+            initial_state = inputs[2:]
+            inputs = inputs[:2]
+
+        def to_list_or_none(x):
+            if x is None or isinstance(x, list):
+                return x
+            if isinstance(x, tuple):
+                return list(x)
+            return [x]
+
+        initial_state = to_list_or_none(initial_state)
+        constants = to_list_or_none(constants)
+
+        return inputs, initial_state, constants
+
+    def __call__(self, inputs, initial_state=None, constants=None, **kwargs):
+        inputs, initial_state, constants = self._standardize_args(
+            inputs, initial_state, constants, self._num_constants)
+
+        if initial_state is None and constants is None:
+            return super(ExternalAttentionRNNWrapper, self).__call__(inputs, **kwargs)
+
+        # If any of `initial_state` or `constants` are specified and are Keras
+        # tensors, then add them to the inputs and temporarily modify the
+        # input_spec to include them.
+
+        additional_inputs = []
+        additional_specs = []
+        if initial_state is not None:
+            kwargs['initial_state'] = initial_state
+            additional_inputs += initial_state
+            self.state_spec = [InputSpec(shape=K.int_shape(state))
+                               for state in initial_state]
+            additional_specs += self.state_spec
+        if constants is not None:
+            kwargs['constants'] = constants
+            additional_inputs += constants
+            self.constants_spec = [InputSpec(shape=K.int_shape(constant))
+                                   for constant in constants]
+            self._num_constants = len(constants)
+            additional_specs += self.constants_spec
+        # at this point additional_inputs cannot be empty
+        is_keras_tensor = K.is_keras_tensor(additional_inputs[0])
+        for tensor in additional_inputs:
+            if K.is_keras_tensor(tensor) != is_keras_tensor:
+                raise ValueError('The initial state or constants of an ExternalAttentionRNNWrapper'
+                                 ' layer cannot be specified with a mix of'
+                                 ' Keras tensors and non-Keras tensors'
+                                 ' (a "Keras tensor" is a tensor that was'
+                                 ' returned by a Keras layer, or by `Input`)')
+
+        if is_keras_tensor:
+            # Compute the full input spec, including state and constants
+            full_input = inputs + additional_inputs
+            full_input_spec = self.input_spec + additional_specs
+            # Perform the call with temporarily replaced input_spec
+            original_input_spec = self.input_spec
+            self.input_spec = full_input_spec
+            output = super(ExternalAttentionRNNWrapper, self).__call__(full_input, **kwargs)
+            self.input_spec = original_input_spec
+            return output
+        else:
+            return super(ExternalAttentionRNNWrapper, self).__call__(inputs, **kwargs)
 
     def get_constants(self, x):
         # add constants to speed up calculation
