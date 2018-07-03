@@ -472,7 +472,8 @@ class ExternalAttentionRNNWrapper(Wrapper):
     def build(self, input_shape):
         self._validate_input_shape(input_shape)
 
-        self.input_spec = [InputSpec(shape=x) for x in input_shape]
+        for i, x in enumerate(input_shape):
+            self.input_spec[i] = InputSpec(shape=x)
         
         if not self.layer.built:
             self.layer.build(input_shape)
@@ -539,11 +540,11 @@ class ExternalAttentionRNNWrapper(Wrapper):
     def call(self, x, constants=None, mask=None, initial_state=None):
         # input shape: (n_samples, time (padded with zeros), input_dim)
         input_shape = self.input_spec[0].shape
-        
+
         if len(x) > 2:
             initial_state = x[2:]
             x = x[:2]
-            assert len(initial_state) == 2
+            assert len(initial_state) >= 1
 
         static_x = x[1]
         x = x[0]
@@ -693,7 +694,7 @@ class ExternalAttentionRNNWrapper(Wrapper):
             original_input_spec = self.input_spec
             self.input_spec = full_input_spec
             output = super(ExternalAttentionRNNWrapper, self).__call__(full_input, **kwargs)
-            self.input_spec = original_input_spec
+            self.input_spec = self.input_spec[:len(original_input_spec)]
             return output
         else:
             return super(ExternalAttentionRNNWrapper, self).__call__(inputs, **kwargs)
