@@ -21,6 +21,7 @@
 import keras.backend as K
 from keras.layers import Layer, Dense, TimeDistributed, Concatenate, InputSpec, Wrapper, RNN
 import numpy as np
+import tensorflow as tf
 
 class ScaledDotProductAttention(Layer):
     """
@@ -328,8 +329,6 @@ class AttentionRNNWrapper(Wrapper):
         else:
             output_dim = self.layer.compute_output_shape(input_shape)[-1]
       
-        print(input_shape, input_dim, output_dim)
-
         self._W1 = self.add_weight(shape=(input_dim, input_dim), name="{}_W1".format(self.name), initializer=self.weight_initializer)
         self._W2 = self.add_weight(shape=(output_dim, input_dim), name="{}_W2".format(self.name), initializer=self.weight_initializer)
         self._W3 = self.add_weight(shape=(2*input_dim, input_dim), name="{}_W3".format(self.name), initializer=self.weight_initializer)
@@ -344,6 +343,14 @@ class AttentionRNNWrapper(Wrapper):
 
         return self.layer.compute_output_shape(input_shape)
     
+    @property
+    def trainable_weights(self):
+        return self._trainable_weights + self.layer.trainable_weights
+
+    @property
+    def non_trainable_weights(self):
+        return self._non_trainable_weights + self.layer.non_trainable_weights
+
     def step(self, x, states):        
         h = states[0]
         # states[1] necessary?
@@ -458,7 +465,6 @@ class ExternalAttentionRNNWrapper(Wrapper):
         self.input_spec = [InputSpec(ndim=3), InputSpec(ndim=3)]
         
     def _validate_input_shape(self, input_shape):
-
         if len(input_shape) >= 2:
             if len(input_shape[:2]) != 2:
                 raise ValueError("Layer has to receive two inputs: the temporal signal and the external signal which is constant for all time steps")
@@ -496,6 +502,14 @@ class ExternalAttentionRNNWrapper(Wrapper):
         
         super(ExternalAttentionRNNWrapper, self).build()
         
+    @property
+    def trainable_weights(self):
+        return self._trainable_weights + self.layer.trainable_weights
+
+    @property
+    def non_trainable_weights(self):
+        return self._non_trainable_weights + self.layer.non_trainable_weights
+
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
 
@@ -509,14 +523,14 @@ class ExternalAttentionRNNWrapper(Wrapper):
 
         return output_shape
     
-    def step(self, x, states):        
+    def step(self, x, states):     
         h = states[0]
         # states[1] necessary?
         
         # comes from the constants
-        X_static = states[2]
+        X_static = states[-2]
         # equals K.dot(static_x, self._W1) + self._b2 with X.shape=[bs, L, static_input_dim]
-        total_x_static_prod = states[3]
+        total_x_static_prod = states[-1]
 
         # expand dims to add the vector which is only valid for this time step
         # to total_x_prod which is valid for all time steps
@@ -530,9 +544,7 @@ class ExternalAttentionRNNWrapper(Wrapper):
         h, new_states = self.layer.cell.call(x, states[:-2])
         
         # append attention to the states to "smuggle" it out of the RNN wrapper
-
         attention = K.squeeze(attention, -1)
-
         h = K.concatenate([h, attention])
 
         return h, new_states
@@ -559,7 +571,7 @@ class ExternalAttentionRNNWrapper(Wrapper):
         if not constants:
             constants = []
         constants += self.get_constants(static_x)
-        
+
         last_output, outputs, states = K.rnn(
             self.step,
             x,
@@ -702,7 +714,6 @@ class ExternalAttentionRNNWrapper(Wrapper):
     def get_constants(self, x):
         # add constants to speed up calculation
         constants = [x, K.dot(x, self._W1) + self._b2]
-        
         return constants
 
     def get_config(self):
