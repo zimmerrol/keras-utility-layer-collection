@@ -1,7 +1,15 @@
-# Keras Utility & Layer Collection
+# Keras Utility & Layer Collection [WIP]
 Collection of custom layers for Keras which are missing in the main framework. These layers might be useful to reproduce current state-of-the-art deep learning papers using Keras.
 
+## Applications
+
+Using this library the following research papers have been reimplemented in Keras:
+
+- [Attention is all you need](https://github.com/FlashTek/attention-is-all-you-need-keras)
+- [Show, attend and tell](https://github.com/FlashTek/show-attend-and-tell-keras)
+
 ## Overview of implemented Layers
+
 At the moment the `Keras Layer Collection` offers the following layers/features:
 
 - [Scaled Dot-Product Attention](#sdpattention)
