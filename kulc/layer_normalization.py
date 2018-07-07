@@ -57,11 +57,11 @@ class LayerNormalization(Layer):
         
         if len(x.shape) == 3:
             mean = K.permute_dimensions(
-                K.repeat(mean, x.shape.as_list()[-1]),
+                K.repeat(mean, x.shape.as_list()[-1:]),
                 [0,2,1]
             )
             std = K.permute_dimensions(
-                K.repeat(std, x.shape.as_list()[-1]),
+                K.repeat(std, x.shape.as_list()[-1:]),
                 [0,2,1] 
             )
             
