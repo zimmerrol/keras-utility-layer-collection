@@ -21,6 +21,7 @@
 import keras.backend as K
 from keras.layers import Layer, Dense, TimeDistributed, Concatenate, InputSpec, Wrapper, RNN
 import numpy as np
+import tensorflow as tf
 
 class ScaledDotProductAttention(Layer):
     """
@@ -72,6 +73,10 @@ class ScaledDotProductAttention(Layer):
         else:
             return output
 
+    def get_config(self):
+        config = {'return_attention': self._return_attention}
+        base_config = super(ScaledDotProductAttention, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
 class MultiHeadAttention(Layer):
     """
@@ -108,8 +113,6 @@ class MultiHeadAttention(Layer):
         return input_shape[1]
     
     def _validate_input_shape(self, input_shape):
-        if not isinstance(input_shape, [list, tuple]):
-            raise ValueError("Layer received an input of type {0} but expected a list of three keras tensors.".format(type(input_shape)))
         if len(input_shape) != 3:
             raise ValueError("Layer received an input shape {0} but expected three inputs (Q, V, K).".format(input_shape))
         else:
@@ -183,6 +186,10 @@ class MultiHeadAttention(Layer):
         else:
             return output        
 
+    def get_config(self):
+        config = {'h': self._h, 'd_k': self._d_k , 'd_v': self._d_v, 'd_model': self._d_model, 'activation': self._activation, 'return_attention': self._return_attention}
+        base_config = super(MultiHeadAttention, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
 # https://wanasit.github.io/attention-based-sequence-to-sequence-in-keras.html
 # https://arxiv.org/pdf/1508.04025.pdf
@@ -286,6 +293,11 @@ class SequenceAttention(Layer):
         
         return similarity
 
+    def get_config(self):
+        config = {'similarity': self._similarity, 'kernel_initializer': self._kernel_initializer}
+        base_config = super(SequenceAttention, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
 class AttentionRNNWrapper(Wrapper):
     """
         The idea of the implementation is based on the paper:
@@ -330,8 +342,6 @@ class AttentionRNNWrapper(Wrapper):
         else:
             output_dim = self.layer.compute_output_shape(input_shape)[-1]
       
-        print(input_shape, input_dim, output_dim)
-
         self._W1 = self.add_weight(shape=(input_dim, input_dim), name="{}_W1".format(self.name), initializer=self.weight_initializer)
         self._W2 = self.add_weight(shape=(output_dim, input_dim), name="{}_W2".format(self.name), initializer=self.weight_initializer)
         self._W3 = self.add_weight(shape=(2*input_dim, input_dim), name="{}_W3".format(self.name), initializer=self.weight_initializer)
@@ -346,14 +356,22 @@ class AttentionRNNWrapper(Wrapper):
 
         return self.layer.compute_output_shape(input_shape)
     
-    def step(self, x, states):        
+    @property
+    def trainable_weights(self):
+        return self._trainable_weights + self.layer.trainable_weights
+
+    @property
+    def non_trainable_weights(self):
+        return self._non_trainable_weights + self.layer.non_trainable_weights
+
+    def step(self, x, states):   
         h = states[0]
         # states[1] necessary?
-        
-        # comes from the constants
+
         # equals K.dot(X, self._W1) + self._b2 with X.shape=[bs, T, input_dim]
-        X = states[2]
-        total_x_prod = states[3]
+        total_x_prod = states[-1]
+        # comes from the constants (equals the input sequence)
+        X = states[-2]
         
         # expand dims to add the vector which is only valid for this time step
         # to total_x_prod which is valid for all time steps
@@ -361,7 +379,7 @@ class AttentionRNNWrapper(Wrapper):
         additive_atn = total_x_prod + hw
         attention = K.softmax(K.dot(additive_atn, self._V), axis=1)
         x_weighted = K.sum(attention * X, [1])
-        
+
         x = K.dot(K.concatenate([x, x_weighted], 1), self._W3) + self._b3
         
         h, new_states = self.layer.cell.call(x, states[:-2])
@@ -371,11 +389,23 @@ class AttentionRNNWrapper(Wrapper):
     def call(self, x, constants=None, mask=None, initial_state=None):
         # input shape: (n_samples, time (padded with zeros), input_dim)
         input_shape = self.input_spec.shape
-        
+
         if self.layer.stateful:
             initial_states = self.layer.states
         elif initial_state is not None:
             initial_states = initial_state
+            if not isinstance(initial_states, (list, tuple)):
+                initial_states = [initial_states]
+
+            # check the initial_states shape
+            base_initial_state = self.layer.get_initial_state(x)
+            if len(base_initial_state) != len(initial_states):
+                raise ValueError("initial_state does not have the correct length. Received length {0} but expected {1}".format(len(initial_states), len(base_initial_state)))
+            else:
+                # check the state' shape
+                for i in range(len(initial_states)):
+                    if not initial_states[i].shape.is_compatible_with(base_initial_state[i].shape):
+                        raise ValueError("initial_state does not match the default base state of the layer. Received {0} but expected {1}".format([x.shape for x in initial_states], [x.shape for x in base_initial_state]))
         else:
             initial_states = self.layer.get_initial_state(x)
             
@@ -426,6 +456,11 @@ class AttentionRNNWrapper(Wrapper):
         
         return constants
 
+    def get_config(self):
+        config = {'weight_initializer': self.weight_initializer}
+        base_config = super(AttentionRNNWrapper, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
 class ExternalAttentionRNNWrapper(Wrapper):
     """
         The basic idea of the implementation is based on the paper:
@@ -460,7 +495,6 @@ class ExternalAttentionRNNWrapper(Wrapper):
         self.input_spec = [InputSpec(ndim=3), InputSpec(ndim=3)]
         
     def _validate_input_shape(self, input_shape):
-
         if len(input_shape) >= 2:
             if len(input_shape[:2]) != 2:
                 raise ValueError("Layer has to receive two inputs: the temporal signal and the external signal which is constant for all time steps")
@@ -498,6 +532,14 @@ class ExternalAttentionRNNWrapper(Wrapper):
         
         super(ExternalAttentionRNNWrapper, self).build()
         
+    @property
+    def trainable_weights(self):
+        return self._trainable_weights + self.layer.trainable_weights
+
+    @property
+    def non_trainable_weights(self):
+        return self._non_trainable_weights + self.layer.non_trainable_weights
+
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
 
@@ -511,14 +553,14 @@ class ExternalAttentionRNNWrapper(Wrapper):
 
         return output_shape
     
-    def step(self, x, states):        
+    def step(self, x, states):  
         h = states[0]
         # states[1] necessary?
         
         # comes from the constants
-        X_static = states[2]
+        X_static = states[-2]
         # equals K.dot(static_x, self._W1) + self._b2 with X.shape=[bs, L, static_input_dim]
-        total_x_static_prod = states[3]
+        total_x_static_prod = states[-1]
 
         # expand dims to add the vector which is only valid for this time step
         # to total_x_prod which is valid for all time steps
@@ -532,9 +574,7 @@ class ExternalAttentionRNNWrapper(Wrapper):
         h, new_states = self.layer.cell.call(x, states[:-2])
         
         # append attention to the states to "smuggle" it out of the RNN wrapper
-
         attention = K.squeeze(attention, -1)
-
         h = K.concatenate([h, attention])
 
         return h, new_states
@@ -555,13 +595,26 @@ class ExternalAttentionRNNWrapper(Wrapper):
             initial_states = self.layer.states
         elif initial_state is not None:
             initial_states = initial_state
+            if not isinstance(initial_states, (list, tuple)):
+                initial_states = [initial_states]
+
+            # check the initial_states shape
+            base_initial_state = self.layer.get_initial_state(x)
+
+            if len(base_initial_state) != len(initial_states):
+                raise ValueError("initial_state does not have the correct length. Received length {0} but expected {1}".format(len(initial_states), len(base_initial_state)))
+            else:
+                # check the state' shape
+                for i in range(len(initial_states)):
+                    if not initial_states[i].shape.is_compatible_with(base_initial_state[i].shape):
+                        raise ValueError("initial_state does not match the default base state of the layer. Received {0} but expected {1}".format([x.shape for x in initial_states], [x.shape for x in base_initial_state]))
         else:
             initial_states = self.layer.get_initial_state(x)
             
         if not constants:
             constants = []
         constants += self.get_constants(static_x)
-        
+
         last_output, outputs, states = K.rnn(
             self.step,
             x,
@@ -704,7 +757,6 @@ class ExternalAttentionRNNWrapper(Wrapper):
     def get_constants(self, x):
         # add constants to speed up calculation
         constants = [x, K.dot(x, self._W1) + self._b2]
-        
         return constants
 
     def get_config(self):
