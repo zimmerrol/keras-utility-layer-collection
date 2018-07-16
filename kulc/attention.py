@@ -32,12 +32,16 @@ class ScaledDotProductAttention(Layer):
 
     def __init__(self, return_attention=False, **kwargs):    
         self._return_attention = return_attention
+        self.supports_masking = True
         super(ScaledDotProductAttention, self).__init__(**kwargs)
     
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
-        
-        return input_shape[1]
+
+        if not self._return_attention:
+            return input_shape[-1]
+        else:
+            return [input_shape[-1], [input_shape[0][0], input_shape[0][1], input_shape[1][2]]]
     
     def _validate_input_shape(self, input_shape):
         if len(input_shape) != 3:
@@ -55,7 +59,7 @@ class ScaledDotProductAttention(Layer):
         
         super(ScaledDotProductAttention, self).build(input_shape)
     
-    def call(self, x):
+    def call(self, x, mask=None):
         q, k, v = x
         d_k = q.shape.as_list()[2]
 
@@ -65,11 +69,22 @@ class ScaledDotProductAttention(Layer):
         # output = tf.matmul(normalized_weights, x_batch)
         
         weights = K.batch_dot(q,  k, axes=[2, 2])
+
+        if mask is not None:
+            # add mask weights
+            if isinstance(mask, (list, tuple)):
+                if len(mask) > 0:
+                    raise ValueError("mask can only be a Tensor or a list of length 1 containing a tensor.")
+
+                mask = mask[0]
+
+            weights += -1e10*(1-mask)
+
         normalized_weights = K.softmax(weights / np.sqrt(d_k))
         output = K.batch_dot(normalized_weights, v)
         
         if self._return_attention:
-            return output, normalized_weights
+            return [output, normalized_weights]
         else:
             return output
 
@@ -78,7 +93,7 @@ class ScaledDotProductAttention(Layer):
         base_config = super(ScaledDotProductAttention, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
-class MultiHeadAttention(Layer):
+class MultiHeadAttention():
     """
         Implementation according to:
             "Attention is all you need" by A Vaswani, N Shazeer, N Parmar (2017)
@@ -110,7 +125,10 @@ class MultiHeadAttention(Layer):
     def compute_output_shape(self, input_shape):
         self._validate_input_shape(input_shape)
         
-        return input_shape[1]
+        if self._return_attention:
+            return [input_shape[-1], [input_shape[0][0], input_shape[1][1], self._h*input_shape[2][2]]]
+        else:
+            return input_shape[-1]
     
     def _validate_input_shape(self, input_shape):
         if len(input_shape) != 3:
@@ -128,6 +146,7 @@ class MultiHeadAttention(Layer):
         
         d_k = self._d_k if self._d_k else input_shape[1][-1]
         d_model = self._d_model if self._d_model else input_shape[1][-1]
+        d_v = self._d_v
         
         self._q_layers = []
         self._k_layers = []
@@ -147,17 +166,20 @@ class MultiHeadAttention(Layer):
             )
             self._v_layers.append(
                 TimeDistributed(
-                    Dense(d_k, activation=self._activation, use_bias=False)
+                    Dense(d_v, activation=self._activation, use_bias=False)
                 )
             )
         
         self._output = TimeDistributed(Dense(d_model))
         #if self._return_attention:
         #    self._output = Concatenate()
-        
-        super(MultiHeadAttention, self).build(input_shape)
     
-    def call(self, x):
+    def __call__(self, x, mask=None):
+        if isinstance(x, (list, tuple)):
+            self.build([it.shape for it in x])
+        else:
+            self.build(x.shape)
+
         q, k, v = x
         
         outputs = []
@@ -168,11 +190,11 @@ class MultiHeadAttention(Layer):
             vi = self._v_layers[i](v)
             
             if self._return_attention:
-                output, attention = self._sdp_layer([qi, ki, vi])
+                output, attention = self._sdp_layer([qi, ki, vi], mask=mask)
                 outputs.append(output)
                 attentions.append(attention)
             else:
-                output = self._sdp_layer([qi, ki, vi])
+                output = self._sdp_layer([qi, ki, vi], mask=mask)
                 outputs.append(output)
             
         concatenated_outputs = Concatenate()(outputs)
@@ -180,16 +202,12 @@ class MultiHeadAttention(Layer):
         
         if self._return_attention:
             attention = Concatenate()(attentions)
+            # print("attention", attention, attention.shape)
        
         if self._return_attention:
             return [output, attention]
         else:
             return output        
-
-    def get_config(self):
-        config = {'h': self._h, 'd_k': self._d_k , 'd_v': self._d_v, 'd_model': self._d_model, 'activation': self._activation, 'return_attention': self._return_attention}
-        base_config = super(MultiHeadAttention, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
 
 # https://wanasit.github.io/attention-based-sequence-to-sequence-in-keras.html
 # https://arxiv.org/pdf/1508.04025.pdf
@@ -397,14 +415,13 @@ class AttentionRNNWrapper(Wrapper):
             if not isinstance(initial_states, (list, tuple)):
                 initial_states = [initial_states]
 
-            # check the initial_states shape
             base_initial_state = self.layer.get_initial_state(x)
             if len(base_initial_state) != len(initial_states):
                 raise ValueError("initial_state does not have the correct length. Received length {0} but expected {1}".format(len(initial_states), len(base_initial_state)))
             else:
                 # check the state' shape
                 for i in range(len(initial_states)):
-                    if not initial_states[i].shape.is_compatible_with(base_initial_state[i].shape):
+                    if not initial_states[i].shape.is_compatible_with(base_initial_state[i].shape): #initial_states[i][j] != base_initial_state[i][j]:
                         raise ValueError("initial_state does not match the default base state of the layer. Received {0} but expected {1}".format([x.shape for x in initial_states], [x.shape for x in base_initial_state]))
         else:
             initial_states = self.layer.get_initial_state(x)
@@ -597,17 +614,6 @@ class ExternalAttentionRNNWrapper(Wrapper):
             initial_states = initial_state
             if not isinstance(initial_states, (list, tuple)):
                 initial_states = [initial_states]
-
-            # check the initial_states shape
-            base_initial_state = self.layer.get_initial_state(x)
-
-            if len(base_initial_state) != len(initial_states):
-                raise ValueError("initial_state does not have the correct length. Received length {0} but expected {1}".format(len(initial_states), len(base_initial_state)))
-            else:
-                # check the state' shape
-                for i in range(len(initial_states)):
-                    if not initial_states[i].shape.is_compatible_with(base_initial_state[i].shape):
-                        raise ValueError("initial_state does not match the default base state of the layer. Received {0} but expected {1}".format([x.shape for x in initial_states], [x.shape for x in base_initial_state]))
         else:
             initial_states = self.layer.get_initial_state(x)
             
