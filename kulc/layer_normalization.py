@@ -40,13 +40,13 @@ class LayerNormalization(Layer):
     def build(self, input_shape):
         self._g = self.add_weight(
             name='gain', 
-            shape=input_shape[1:],
+            shape=(input_shape[-1],),
             initializer=Ones(),
             trainable=True
         )
         self._b = self.add_weight(
             name='bias', 
-            shape=input_shape[1:],
+            shape=(input_shape[-1],),
             initializer=Zeros(),
             trainable=True
         )
@@ -54,14 +54,14 @@ class LayerNormalization(Layer):
     def call(self, x):
         mean = K.mean(x, axis=-1)
         std = K.std(x, axis=-1)
-        
+
         if len(x.shape) == 3:
             mean = K.permute_dimensions(
-                K.repeat(mean, x.shape.as_list()[-1:]),
+                K.repeat(mean, x.shape.as_list()[-1]),
                 [0,2,1]
             )
             std = K.permute_dimensions(
-                K.repeat(std, x.shape.as_list()[-1:]),
+                K.repeat(std, x.shape.as_list()[-1]),
                 [0,2,1] 
             )
             
