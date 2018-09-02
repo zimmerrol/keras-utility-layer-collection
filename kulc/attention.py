@@ -147,6 +147,11 @@ class MultiHeadAttention():
         d_k = self._d_k if self._d_k else input_shape[1][-1]
         d_model = self._d_model if self._d_model else input_shape[1][-1]
         d_v = self._d_v
+
+        if type(d_k) == tf.Dimension:
+            d_k = d_k.value
+        if type(d_model) == tf.Dimension:
+            d_model = d_model.value
         
         self._q_layers = []
         self._k_layers = []
