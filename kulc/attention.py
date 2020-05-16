@@ -19,7 +19,8 @@
 # THE SOFTWARE.
 
 import keras.backend as K
-from keras.layers import Layer, Dense, TimeDistributed, Concatenate, InputSpec, Wrapper, RNN
+from keras.layers import Layer, Dense, TimeDistributed, Concatenate, InputSpec,  RNN
+from keras.layers.wrappers import Wrapper
 import numpy as np
 import tensorflow as tf
 
